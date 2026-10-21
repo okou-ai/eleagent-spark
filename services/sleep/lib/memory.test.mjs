@@ -145,3 +145,91 @@ test('recall_day places memories on a day only by evidence time, never by the ni
   }
   assert.doesNotMatch(section("The day's conversations"), /conversation:previous/);
 });
+
+const owned = (id, name, extra = {}) => ({ id, kind: 'object', layer: 'memory', name, summary: name, name_source: 'user', created_by: 'user-naming', occurrences: 1, ...extra });
+const plain = (id, name, extra = {}) => ({ id, kind: 'object', layer: 'memory', name, summary: name, description: `${name} seen on the desk`, occurrences: 2, ...extra });
+
+test('revise keeps an owner-given name and still updates the description', async (t) => {
+  const mug = owned('object:mug', 'Blue mug'), other = plain('object:cup', 'Cup');
+  const m = memory(t, { [mug.id]: mug, [other.id]: other });
+  const refused = await m.revise({ id: mug.id, name: 'Ceramic cup' });
+  assert.match(refused.text, /Kept the name "Blue mug": the owner named object:mug, so only its description can be revised/);
+  assert.equal(m.nodes.get(mug.id).name, 'Blue mug');
+  assert.equal(m.nodes.get(mug.id).summary, 'Blue mug');
+  assert.equal(m.nodes.get(mug.id)._touched, undefined);
+  const both = await m.revise({ id: mug.id, name: 'Ceramic cup', description: 'A blue ceramic mug with a chipped rim' });
+  assert.match(both.text, /^Updated the description\. Kept the name "Blue mug"/);
+  assert.equal(m.nodes.get(mug.id).name, 'Blue mug');
+  assert.equal(m.nodes.get(mug.id).description, 'A blue ceramic mug with a chipped rim');
+  assert.equal((await m.revise({ id: mug.id, name: 'Blue mug', description: 'Same name is fine' })).text, 'Updated.');
+  // Memories the owner did not name are revised as before.
+  assert.equal((await m.revise({ id: other.id, name: 'Paper cup' })).text, 'Updated.');
+  assert.equal(m.nodes.get(other.id).name, 'Paper cup');
+});
+
+test('forget never removes an owner-named memory', async (t) => {
+  const mug = owned('object:mug', 'Blue mug'), other = plain('object:cup', 'Cup');
+  const m = memory(t, { [mug.id]: mug, [other.id]: other });
+  const result = await m.forget({ ids: [mug.id, other.id], why: 'clutter' });
+  assert.equal(result.text, 'Forgot 1 fragment(s). Kept object:mug "Blue mug": named by the owner, so it cannot be forgotten.');
+  assert.ok(m.nodes.has(mug.id));
+  assert.equal(m.nodes.has(other.id), false);
+});
+
+test('consolidate keeps the owner-named memory as the survivor with its name', async (t) => {
+  const link = (a, b, text) => ({ [pairKey(a, b)]: { a, b, text } });
+  const person = { id: 'person:ann', kind: 'person', layer: 'memory', name: 'Ann' };
+  const mug = owned('object:mug', 'Blue mug', { object_vec: [1, 0], object_vec_n: 1 });
+  const cup = plain('object:cup', 'Ceramic cup', { object_vec: [0, 1], object_vec_n: 1 });
+  const m = memory(t, { [mug.id]: mug, [cup.id]: cup, [person.id]: person }, link(cup.id, person.id, 'Ann drinks from the cup.'));
+  // Asked to merge the owner-named mug into another memory: the other memory merges into the mug instead.
+  const result = await m.consolidate({ ids: [mug.id], into: cup.id, why: 'same object' });
+  assert.match(result.text, /^Consolidated 1 fragment\(s\) into object:mug \(Blue mug\)/);
+  assert.match(result.text, /object:mug "Blue mug" was named by the owner, so it is the surviving memory and keeps its name; object:cup merged into it\./);
+  assert.equal(m.nodes.has(cup.id), false);
+  const kept = m.nodes.get(mug.id);
+  assert.equal(kept.name, 'Blue mug');
+  assert.equal(kept.name_source, 'user');
+  // The surviving memory takes over the merged one's description (it had none), prototype and links.
+  assert.equal(kept.description, 'Ceramic cup seen on the desk');
+  assert.equal(kept.object_vec_n, 2);
+  assert.ok(m.edges.has(pairKey(mug.id, person.id)));
+  assert.deepEqual(m.mergedInto, { [cup.id]: mug.id });
+
+  // A request for a new memory folds the others into the owner-named one instead.
+  const lid = plain('object:lid', 'Lid');
+  m.nodes.set(lid.id, lid);
+  const fresh = await m.consolidate({ ids: [lid.id, mug.id], new: { kind: 'object', name: 'Mug set', description: 'A mug and its lid' }, why: 'one thing' });
+  assert.match(fresh.text, /into object:mug \(Blue mug\).*no new memory was created\./);
+  assert.equal(m.nodes.has(lid.id), false);
+  assert.equal([...m.nodes.values()].filter((n) => n.name === 'Mug set').length, 0);
+  assert.equal(m.nodes.get(mug.id).name, 'Blue mug');
+
+  // Merging into the owner-named memory directly works as before.
+  const saucer = plain('object:saucer', 'Saucer');
+  m.nodes.set(saucer.id, saucer);
+  await m.consolidate({ ids: [saucer.id], into: mug.id, why: 'same object' });
+  assert.equal(m.nodes.has(saucer.id), false);
+  assert.equal(m.nodes.get(mug.id).name, 'Blue mug');
+});
+
+test('consolidate refuses to merge two owner-named memories or to fold one into the owner', async (t) => {
+  const mug = owned('object:mug', 'Blue mug'), watch = owned('object:watch', 'Grandpa watch'), cup = plain('object:cup', 'Cup');
+  const owner = { id: 'person:owner', kind: 'person', layer: 'memory', name: 'Owner' };
+  const m = memory(t, { [mug.id]: mug, [watch.id]: watch, [cup.id]: cup, [owner.id]: owner });
+  const before = JSON.stringify([...m.nodes]);
+  await assert.rejects(m.consolidate({ ids: [mug.id], into: watch.id, why: 'test' }), /object:watch and object:mug were each named by the owner/);
+  await assert.rejects(m.consolidate({ ids: [mug.id, watch.id, cup.id], new: { kind: 'object', name: 'Things', description: 'Things' }, why: 'test' }), /each named by the owner/);
+  await assert.rejects(m.consolidate({ ids: [mug.id], into: owner.id, why: 'test' }), /cannot be merged into person:owner/);
+  await assert.rejects(m.consolidate({ ids: [mug.id], new: { kind: 'object', name: 'Cup', description: 'Renamed' }, why: 'test' }), /keeps its name; nothing else was given/);
+  assert.equal(JSON.stringify([...m.nodes]), before);
+});
+
+test('recall_day and view_memory mark owner-named memories', async (t) => {
+  const mug = owned('object:mug', 'Blue mug'), cup = plain('object:cup', 'Cup');
+  const m = memory(t, { [mug.id]: mug, [cup.id]: cup });
+  const { text } = await m.recall_day();
+  assert.match(text, /object:mug \| object \| Blue mug \[named by the owner\] \|/);
+  assert.match(text, /object:cup \| object \| Cup \|/);
+  assert.match((await m.view_memory({ id: mug.id })).text, /^object:mug \| object \| Blue mug \[named by the owner\]/);
+});

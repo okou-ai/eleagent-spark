@@ -1,9 +1,11 @@
 """Speech pipeline: CAM++ voiceprint diarization, then Qwen3-ASR per speaker turn.
 
-Consecutive archived clips of one capture are stitched (real gaps capped at 0.5 s), split into
-speaker turns by voiceprint, matched to persistent `voice_*` entities, transcribed turn by turn,
-and written as `speech` timeline events plus entity samples. First installation processes the
-archive backlog; later worker generations retain saved progress without replaying completed history.
+Each archived clip is analysed as soon as it arrives, stitched (real gaps capped at 0.5 s) after
+the clip(s) still held for its capture, split into speaker turns by voiceprint, matched to
+persistent `voice_*` entities, and only the turns that have finished are transcribed and written
+as `speech` timeline events plus entity samples; a turn still running at the end of the received
+audio waits for the next clip. First installation processes the archive backlog; later worker
+generations retain saved progress without replaying completed history.
 """
 from __future__ import annotations
 import argparse, hashlib, json, math, os, subprocess, tempfile, time
@@ -11,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import numpy as np
 from .night_pause import NightPause
+from .outbox import deliver
 
 SR = 16000
 PIPELINE = 'speech-v1'
@@ -22,6 +25,10 @@ MATCH_SIM, MATCH_MARGIN = .55, .05          # batch speaker -> persistent voice 
 ASSIGN_SIM = .35                            # 2 s window -> nearest speaker, else unknown
 CONTEXT_SECONDS = 2.5                       # shorter turns get no glossary (it can be echoed back)
 EMBED_TURN_SECONDS = 2.0                    # only longer turns contribute prototypes
+TURN_GAP_SECONDS = .8                       # a shorter pause continues the same speaker's turn
+MIN_TURN_SECONDS = .25                      # shorter remnants of an already published turn are dropped
+MAX_HOLD_CLIPS = 6                          # speech still running after this many clips is published anyway
+POLL_SECONDS = .5
 
 
 def sha16(path):
@@ -63,7 +70,7 @@ def build_turns(regions, windows, labels):
             c[3] = p[3]
     turns = []
     for _, a, b, label in pieces:
-        if turns and turns[-1]['speaker'] == label and a - turns[-1]['end'] < .8 * SR:
+        if turns and turns[-1]['speaker'] == label and a - turns[-1]['end'] < TURN_GAP_SECONDS * SR:
             turns[-1]['end'] = b
         else:
             turns.append({'speaker': label, 'start': a, 'end': b})
@@ -92,6 +99,41 @@ def media_refs(spans, start, end):
             refs.append({'media_id': span['media_id'], 'start_offset_seconds': start_s, 'end_offset_seconds': end_s,
                          'alignment': 'decoded_audio_stream_pts'})
     return refs
+
+
+def parse_time(value):
+    return datetime.fromisoformat(value.replace('Z', '+00:00'))
+
+
+def clip_end(asset):
+    return parse_time(asset['captured_at']) + timedelta(seconds=float(asset['duration_seconds']))
+
+
+def sample_at(spans, moment):
+    """Absolute time -> stitched sample index, clamped to the stitched audio (None = its start)."""
+    if moment is None:
+        return 0
+    for span in spans:
+        rel = (moment - span['t0']).total_seconds()
+        if rel < (span['end'] - span['begin']) / SR:
+            return span['begin'] + max(0, int(round(rel * SR)))
+    return spans[-1]['end']
+
+
+def select_turns(turns, published, end, publish_all):
+    """-> (turns to publish now, start sample of the first turn that must wait, or None).
+    Audio before `published` was published by an earlier analysis of the same capture. A turn ending
+    within TURN_GAP_SECONDS of the received audio's end may still continue in the next clip."""
+    ready, hold = [], None
+    for turn in turns:
+        start = max(turn['start'], published)
+        if turn['end'] - start < MIN_TURN_SECONDS * SR:
+            continue
+        if not publish_all and turn['end'] > end - TURN_GAP_SECONDS * SR:
+            hold = start if hold is None else min(hold, start)
+            continue
+        ready.append({**turn, 'start': start})
+    return ready, hold
 
 
 def echoes_glossary(text, glossary):
@@ -132,7 +174,7 @@ class Models:
 
 
 class SpeechWorker:
-    def __init__(self, store, archive_url, token, models, glossary=DEFAULT_GLOSSARY, window_clips=6, idle_seconds=45, reprocess_history=False):
+    def __init__(self, store, archive_url, token, models, glossary=DEFAULT_GLOSSARY, window_clips=2, idle_seconds=8, reprocess_history=False):
         import httpx
         self.store, self.models, self.glossary = store, models, glossary
         self.window_clips, self.idle_seconds, self.reprocess_history = window_clips, idle_seconds, reprocess_history
@@ -163,16 +205,27 @@ class SpeechWorker:
             if not page['has_more']:
                 break
 
-    def ready_batch(self, now=None):
-        now = now or time.time()
-        groups = {}
-        for row in self.store.db.execute('SELECT capture_id,clip_seq,asset,seen_at FROM speech_pending ORDER BY capture_id,clip_seq'):
-            groups.setdefault(row['capture_id'], []).append(row)
-        for rows in sorted(groups.values(), key=lambda r: r[0]['seen_at']):
-            if len(rows) >= self.window_clips:
-                return [json.loads(r['asset']) for r in rows[:self.window_clips]]
-            if now - max(r['seen_at'] for r in rows) >= self.idle_seconds:
-                return [json.loads(r['asset']) for r in rows]
+    def ready(self, now=None):
+        """Next unit of work for one capture, or None. New clips go first, each analysed right away after
+        the clips still held for its capture (`stream`); a clip arriving after later ones were analysed is
+        transcribed on its own (`late`); a capture idle for idle_seconds publishes what it still holds (`flush`)."""
+        now = time.time() if now is None else now
+        rows = lambda table: self.store.db.execute(
+            f'SELECT media_id,capture_id,clip_seq,asset,seen_at FROM {table} ORDER BY capture_id,clip_seq').fetchall()
+        pending, held = {}, {}
+        for row in rows('speech_pending'):
+            pending.setdefault(row['capture_id'], []).append(row)
+        for row in rows('speech_context'):
+            held.setdefault(row['capture_id'], []).append(row)
+        for capture_id in sorted(pending, key=lambda c: min(r['seen_at'] for r in pending[c])):
+            new, context = pending[capture_id], held.get(capture_id, [])
+            late = [r for r in new if context and r['clip_seq'] <= context[-1]['clip_seq']]
+            if late:
+                return {'capture_id': capture_id, 'mode': 'late', 'context': [], 'new': late}
+            return {'capture_id': capture_id, 'mode': 'stream', 'context': context, 'new': new[:self.window_clips]}
+        for capture_id, context in held.items():
+            if now - max(r['seen_at'] for r in context) >= self.idle_seconds:
+                return {'capture_id': capture_id, 'mode': 'flush', 'context': context, 'new': []}
         return None
 
     def load_audio(self, asset, directory):
@@ -194,8 +247,10 @@ class SpeechWorker:
             '-f', 'f32le', '-'], capture_output=True, check=True, timeout=30).stdout
         return np.frombuffer(pcm, np.float32), max(0., origin)
 
-    def analyze(self, batch):
-        """Return (samples, events, turns) for one batch of consecutive clips of a single capture."""
+    def analyze(self, batch, published_until=None, publish_all=True):
+        """Return (samples, events, progress) for consecutive clips of a single capture. Only turns after
+        `published_until` are transcribed; unless publish_all, a turn that may still continue waits.
+        progress = {'published_until': datetime | None, 'hold_from': datetime | None}."""
         parts, spans, cursor, previous_end = [], [], 0, None
         with tempfile.TemporaryDirectory(prefix='speech-') as directory:
             for asset in sorted(batch, key=lambda a: a['clip_seq']):
@@ -210,11 +265,12 @@ class SpeechWorker:
                               'origin': origin, 'duration': float(asset['duration_seconds'])})
                 parts.append(audio); cursor += len(audio); previous_end = t0 + timedelta(seconds=len(audio) / SR)
         if not parts:
-            return [], [], []
+            return [], [], {'published_until': published_until, 'hold_from': None}
         audio = np.concatenate(parts)
+        audio_end = locate(spans, len(audio) - 1)[0] + timedelta(seconds=1 / SR)
         regions = self.models.regions(audio)
         if not regions:
-            return [], [], []
+            return [], [], {'published_until': audio_end if publish_all else published_until, 'hold_from': None}
         capture_id = batch[0]['capture_id']
         batch_start = spans[0]['t0']
         windows = windows_for(regions)
@@ -245,11 +301,12 @@ class SpeechWorker:
             scored = sorted(((max(float(vector @ p) for p in protos), eid) for eid, protos in candidates.items()), reverse=True)
             ok = scored and scored[0][0] >= ASSIGN_SIM
             labels.append(scored[0][1] if ok else None); sims.append(scored[0][0] if scored else None)
-        turns = build_turns(regions, windows, labels)
-        # Stage 2: transcribe each turn; glossary only for longer turns.
+        turns, hold = select_turns(build_turns(regions, windows, labels), sample_at(spans, published_until), len(audio), publish_all)
+        # Stage 2: transcribe each finished turn; glossary only for longer turns.
         waves = [audio[max(0, t['start'] - SR // 10):t['end'] + SR // 10] for t in turns]
         contexts = [('Words that may appear in the conversation: ' + ', '.join(self.glossary)) if (t['end'] - t['start']) >= CONTEXT_SECONDS * SR else '' for t in turns]
         texts = self.models.transcribe(waves, contexts)
+        published = max([locate(spans, t['end'] - 1)[0] for t in turns] + [published_until] * bool(published_until), default=None)
         samples, events = [], []
         for turn, text, context in zip(turns, texts, contexts):
             if not text or echoes_glossary(text, self.glossary):
@@ -281,36 +338,73 @@ class SpeechWorker:
                          'pipeline': self.pipeline, 'asr_model': self.models.asr_version, 'diarization_model': self.models.voice_model,
                          'clock_source': 'client_wall_clock_plus_audio_pts',
                          'identity_semantics': 'voiceprint_cluster_not_verified_identity'}})
-        return samples, events, [{**t, 'text': x} for t, x in zip(turns, texts)]
+        return samples, events, {'published_until': audio_end if publish_all else published,
+                                 'hold_from': None if hold is None else locate(spans, hold)[0]}
+
+    def step(self, unit, record_events=True):
+        """Analyse one unit from ready(), commit its turns and the capture's held clips; return its events."""
+        db, capture_id, mode = self.store.db, unit['capture_id'], unit['mode']
+        progress = db.execute('SELECT published_until,holding FROM speech_progress WHERE capture_id=?', (capture_id,)).fetchone()
+        rows = unit['context'] + unit['new']
+        window = [json.loads(r['asset']) for r in rows]
+        samples, events, done = [], [], None
+        if mode != 'flush' or (progress and progress['holding']):
+            from . import metrics
+            key = 'speech_failures:' + rows[-1]['media_id']
+            started = time.perf_counter()
+            published = parse_time(progress['published_until']) if mode != 'late' and progress and progress['published_until'] else None
+            try:
+                samples, events, done = self.analyze(window, published, mode != 'stream' or len(window) >= MAX_HOLD_CLIPS)
+                metrics.job('speech_batch', 'ok', time.perf_counter() - started)
+                metrics.EVENTS.labels(metrics.SERVICE, 'speech_turns', 'transcribed').inc(len(events))
+            except Exception as error:
+                metrics.job('speech_batch', 'error', time.perf_counter() - started)
+                failures = int(self.store.config(key, '0')) + 1
+                self.store.set_config(key, str(failures))
+                if failures < 3:
+                    raise
+                # Clips that keep failing must not block later speech; the originals stay archived.
+                self.store.set_config('speech_skipped:' + rows[-1]['media_id'], json.dumps({'error': type(error).__name__, 'detail': str(error)[:200]}))
+                metrics.job('speech_batch', 'skipped')
+            self.store.record_speech(samples, events if record_events else [])
+            # Speakers are matched/created before transcription; anything left without a sample is noise.
+            self.store.prune_empty_entities(self.models.voice_model)
+        with db:
+            db.executemany('DELETE FROM speech_pending WHERE media_id=?', [(r['media_id'],) for r in unit['new']])
+            if mode == 'stream' and done:
+                # Hold the clips from the first unfinished turn on (at least the newest clip) as the next context.
+                keep_from = done['hold_from'] or clip_end(window[-1])
+                keep = [r for r, a in zip(rows, window) if clip_end(a) > keep_from] or rows[-1:]
+                db.execute('DELETE FROM speech_context WHERE capture_id=?', (capture_id,))
+                db.executemany('INSERT INTO speech_context VALUES (?,?,?,?,?)', [tuple(r) for r in keep])
+                db.execute('INSERT OR REPLACE INTO speech_progress VALUES (?,?,?)', (capture_id,
+                    done['published_until'] and done['published_until'].isoformat(), int(done['hold_from'] is not None)))
+            elif mode != 'late':
+                db.execute('DELETE FROM speech_context WHERE capture_id=?', (capture_id,))
+                db.execute('DELETE FROM speech_progress WHERE capture_id=?', (capture_id,))
+        if record_events and events:
+            self.publish(events)
+        print(json.dumps({'status': 'batch_done', 'mode': mode, 'capture': capture_id[-8:], 'clips': len(rows),
+                          'new': len(unit['new']), 'turns': len(events), 'holding': bool(done and done['hold_from'])}), flush=True)
+        return events
+
+    def publish(self, events):
+        """Deliver this unit's events now instead of waiting for the recognition worker's outbox flush."""
+        from . import metrics
+        try:
+            deliver(self.archive, self.store, self.store.outbox_events([e['event_id'] for e in events]))
+        except Exception as error:
+            print(json.dumps({'status': 'delivery_deferred', 'error_class': type(error).__name__}), flush=True)
+            return
+        for event in events:
+            metrics.job('speech_turn_lag', 'published', max(0., time.time() - parse_time(event['ended_at']).timestamp()))
 
     def tick(self):
         self.discover()
-        batch = self.ready_batch()
-        if not batch:
+        unit = self.ready()
+        if not unit:
             return False
-        from . import metrics
-        key = 'speech_failures:' + batch[0]['media_id']
-        started = time.perf_counter()
-        try:
-            samples, events, _ = self.analyze(batch)
-            metrics.job('speech_batch', 'ok', time.perf_counter() - started)
-            metrics.EVENTS.labels(metrics.SERVICE, 'speech_turns', 'transcribed').inc(len(events))
-        except Exception as error:
-            metrics.job('speech_batch', 'error', time.perf_counter() - started)
-            failures = int(self.store.config(key, '0')) + 1
-            self.store.set_config(key, str(failures))
-            if failures < 3:
-                raise
-            # A batch that keeps failing must not block later speech; the originals stay archived.
-            self.store.set_config('speech_skipped:' + batch[0]['media_id'], json.dumps({'error': type(error).__name__, 'detail': str(error)[:200]}))
-            samples, events = [], []
-            metrics.job('speech_batch', 'skipped')
-        self.store.record_speech(samples, events)
-        # Speakers are matched/created before transcription; anything left without a sample is noise.
-        self.store.prune_empty_entities(self.models.voice_model)
-        with self.store.db:
-            self.store.db.executemany('DELETE FROM speech_pending WHERE media_id=?', [(a['media_id'],) for a in batch])
-        print(json.dumps({'status': 'batch_done', 'capture': batch[0]['capture_id'][-8:], 'clips': len(batch), 'turns': len(events)}), flush=True)
+        self.step(unit)
         return True
 
 
@@ -321,15 +415,17 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--state', default='/data/entities.sqlite'); p.add_argument('--weights', default=os.environ.get('ENTITY_WEIGHTS_DIR', '/models/entities'))
     p.add_argument('--campplus', default='/models/campplus'); p.add_argument('--asr', default='/models/qwen3-asr-1.7b')
-    p.add_argument('--device', choices=('cuda', 'cpu'), default='cuda'); p.add_argument('--window-clips', type=int, default=6)
+    p.add_argument('--device', choices=('cuda', 'cpu'), default='cuda'); p.add_argument('--window-clips', type=int, default=2, help='new clips per analysis while catching up')
     p.add_argument('--language', default=os.environ.get('ASR_LANGUAGE') or None, help='ASR language name; omit for automatic detection')
-    p.add_argument('--idle-seconds', type=float, default=45); p.add_argument('--glossary-file')
+    p.add_argument('--idle-seconds', type=float, default=8); p.add_argument('--glossary-file')
     p.add_argument('--reprocess-history', action='store_true')
     p.add_argument('--replay-capture', help='analyze one capture into --state (use a copy of the DB) and write events JSON to --dry-run-out')
     p.add_argument('--dry-run-out')
     p.add_argument('--start-cursor', type=int, help='testing: initial feed cursor when none is stored')
     p.add_argument('--exit-when-idle', action='store_true', help='testing: stop once nothing is ready')
     a = p.parse_args()
+    import logging
+    logging.getLogger('httpx').setLevel(logging.WARNING)  # the archive feed is polled twice a second
     glossary = [x.strip() for x in Path(a.glossary_file).read_text().splitlines() if x.strip()] if a.glossary_file else DEFAULT_GLOSSARY
     night_pause = NightPause('speech')
     models = Models(a.weights, a.campplus, a.asr, a.device, a.language)
@@ -342,13 +438,21 @@ def main():
             if not page['has_more']:
                 break
         clips = sorted((i for i in items if i['capture_id'] == a.replay_capture), key=lambda i: i['clip_seq'])
+        # Feed clips in capture order as if each just arrived, then let the capture go idle.
+        # Samples are recorded like the live loop so later units can match speakers; --state must be a DB copy.
         out = []
-        for i in range(0, len(clips), a.window_clips):
-            t = time.perf_counter(); samples, events, _ = worker.analyze(clips[i:i + a.window_clips])
-            # Record like the live loop so later batches can match speakers; --state must be a DB copy.
-            worker.store.record_speech(samples, [])
-            out.append({'clips': len(clips[i:i + a.window_clips]), 'seconds': round(time.perf_counter() - t, 2), 'events': events})
-            print('batch', i // a.window_clips, len(events), 'turns', out[-1]['seconds'], 's', flush=True)
+        def drain(now):
+            while unit := worker.ready(now):
+                t = time.perf_counter(); events = worker.step(unit, record_events=False)
+                out.append({'mode': unit['mode'], 'arrived': now, 'clips': len(unit['context']) + len(unit['new']),
+                            'seconds': round(time.perf_counter() - t, 2), 'events': events})
+        for clip in clips:
+            arrived = clip_end(clip).timestamp()
+            with worker.store.db:
+                worker.store.db.execute('INSERT OR IGNORE INTO speech_pending VALUES (?,?,?,?,?)',
+                    (clip['media_id'], clip['capture_id'], int(clip['clip_seq']), json.dumps(clip), arrived))
+            drain(arrived)
+        drain(math.inf)
         Path(a.dry_run_out).write_text(json.dumps(out, ensure_ascii=False, indent=1))
         return
     if a.start_cursor is not None and worker.store.config(worker.cursor_key) is None:
@@ -357,7 +461,7 @@ def main():
     night_pause.publish_ready()
     while True:
         try:
-            # A full batch commits before reaching this boundary. Pending clips stay intact.
+            # A unit commits before reaching this boundary. Pending and held clips stay intact.
             if night_pause.paused():
                 if a.exit_when_idle:
                     return
@@ -366,7 +470,7 @@ def main():
             if not worker.tick():
                 if a.exit_when_idle:
                     return
-                time.sleep(3)
+                time.sleep(POLL_SECONDS)
         except Exception as error:
             print(json.dumps({'status': 'retry_pending', 'error_class': type(error).__name__, 'detail': str(error)[:200]}), flush=True)
             time.sleep(15)

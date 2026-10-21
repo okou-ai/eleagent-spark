@@ -154,7 +154,7 @@ describe('generic graph API against an isolated real Neo4j', {
       await client.connect(new StreamableHTTPClientTransport(new URL(`${origin}/mcp`), {
         requestInit: { headers: { Authorization: `Bearer ${token}` } },
       }));
-      assert.equal((await client.listTools()).tools.length, 6);
+      assert.equal((await client.listTools()).tools.length, 7);
       const call = async (name, args) => {
         const result = await client.callTool({ name, arguments: args });
         assert.ok(!result.isError, JSON.stringify(result));

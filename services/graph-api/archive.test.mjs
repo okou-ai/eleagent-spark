@@ -419,3 +419,28 @@ test('publicBaseUrl uses public graph origin; config errors never expose credent
     assert.throws(() => new ArchiveClient(config), (error) => { sanitized(error.message); return error.status === 503; });
   }
 });
+
+test('frames by capture time resolve the covering clip and offset; by media id use the offsets given', async (t) => {
+  const { client, requests } = await fake(t, (req, res) => {
+    const url = new URL(req.url, 'http://fake');
+    if (url.pathname === '/v1/archive/media') return json(res, { items: [clip('media_a', 0), clip('media_b', 10)], has_more: false, next_cursor: null });
+    if (url.pathname.endsWith('/frame')) { res.writeHead(200, { 'Content-Type': 'image/jpeg' }); return res.end(Buffer.from([0xff, 0xd8, 0xff, 0xd9])); }
+    res.writeHead(404); res.end();
+  });
+  const frames = await client.getFrames({ capture_id: 'capture1', at: [at(12.5)] });
+  assert.equal(frames[0].media_id, 'media_b');
+  assert.equal(frames[0].offset_s, 2.5);
+  const frameRequest = requests.at(-1), query = new URL(frameRequest.url, 'http://fake').searchParams;
+  assert.equal(new URL(frameRequest.url, 'http://fake').pathname, '/v1/archive/media/media_b/frame');
+  assert.equal(query.get('t'), '2.500');
+  assert.equal(query.get('size'), '768');
+  assert.equal(frameRequest.headers.authorization, `Bearer ${token}`);
+  assert.deepEqual([...frames[0].jpeg], [0xff, 0xd8, 0xff, 0xd9]);
+  const [last] = await client.getFrames({ capture_id: 'capture1', at: [at(19.95)] });
+  assert.deepEqual([last.media_id, last.offset_s], ['media_b', 9.75]);
+  const direct = await client.getFrames({ media_id: 'media_a', offsets: [1, 4.25], size: 320 });
+  assert.deepEqual(direct.map((f) => [f.media_id, f.offset_s, f.size]), [['media_a', 1, 320], ['media_a', 4.25, 320]]);
+  await assert.rejects(client.getFrames({ capture_id: 'capture1', at: [at(500)] }), (e) => e instanceof ArchiveError && e.status === 404);
+  await assert.rejects(client.getFrames({ media_id: 'media_a' }), (e) => e instanceof ArchiveError && e.status === 400);
+  await assert.rejects(client.getFrames({ media_id: 'media_a', offsets: [1], capture_id: 'capture1' }), (e) => e.status === 400);
+});

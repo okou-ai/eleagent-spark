@@ -1,6 +1,7 @@
 import { CaptureState, CLIP_MS, MAX_CLIP_BYTES, bufferHasRoom, bufferRecovered, captureCamera, formatAgo, formatElapsed,
   newCaptureId, recorderType, resumesAutomatically, uploadDisposition } from './capture-state.js';
 import { openQueue } from './queue.js';
+import { freshNamings, namingMessage, noticeTone } from './notices.js';
 
 const $ = id => document.getElementById(id);
 const CAMERA_KEY = 'eleagent-camera';
@@ -352,7 +353,65 @@ window.addEventListener('beforeunload', event => {
   if (session || pending.count || ['recording', 'acquiring'].includes(state.phase)) { event.preventDefault(); event.returnValue = ''; }
 });
 
+// The Okou mark: grey until Eleagent is connected to the owner's Okou (requests said to Okou go there), in colour
+// once it is. Grey opens Okou's sign-in and comes back here; colour opens the connection page.
+async function okouStatus() {
+  const button = $('okou');
+  if (!button) return;
+  try {
+    const response = await fetch('/okou/status', { cache: 'no-store' });
+    const connected = response.ok && (await response.json()).connected === true;
+    button.dataset.connected = String(connected);
+    button.setAttribute('aria-label', connected ? 'Okou connected' : 'Connect Okou');
+  } catch { /* offline: keep the last state */ }
+}
+$('okou')?.addEventListener('click', () => {
+  location.href = $('okou').dataset.connected === 'true' ? '/okou' : '/okou/connect';
+});
+
+// What Eleagent did with what was said (a naming, a request handed to Okou), as a toast: GET /v1/notices every
+// NOTICES_MS while the page is in front. The server answers 304 while nothing changed; the first list only seeds what
+// counts as seen, so opening the page replays nothing.
+const NOTICES_MS = 5_000, TOAST_MS = 3_500;
+let noticesTag = null, noticesSeen = null, noticesTimer, noticing = false, toastTimer;
+async function pollNotices() {
+  clearTimeout(noticesTimer);
+  if (noticing || document.hidden || blocked === 'auth') return;
+  noticing = true;
+  try {
+    const response = await fetch('/v1/notices', { cache: 'no-store', credentials: 'same-origin', redirect: 'manual',
+      headers: { ...(noticesTag ? { 'If-None-Match': noticesTag } : {}) } });
+    if (response.status === 200) {
+      const body = await response.json();
+      noticesTag = response.headers.get('ETag');
+      if (Array.isArray(body.namings)) announce(body.namings);
+    }
+  } catch { /* The next poll retries. */ } finally { noticing = false; }
+  if (!document.hidden) noticesTimer = setTimeout(() => void pollNotices(), NOTICES_MS);
+}
+function announce(namings) {
+  const { fresh, seen } = freshNamings(noticesSeen, namings);
+  noticesSeen = seen;
+  for (const item of fresh) {
+    const text = namingMessage(item);
+    if (!text) continue;
+    const toast = $('toast');
+    toast.textContent = text;
+    toast.dataset.tone = noticeTone(item.status);
+    toast.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { toast.hidden = true; }, TOAST_MS);
+  }
+}
+
 async function initialize() {
+  void okouStatus();
+  void pollNotices();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    void okouStatus();
+    void pollNotices();
+  });
   if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia || !window.MediaRecorder || !window.indexedDB || !navigator.locks) {
     fatal = 'Open in Safari or Chrome over HTTPS';
     render();

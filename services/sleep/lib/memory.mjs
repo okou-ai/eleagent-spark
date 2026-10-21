@@ -17,6 +17,9 @@ const isMem = (n) => n?.layer === 'memory';
 const VEC = { object_appearance: 'object_vec', face_appearance: 'face_vec', speech_segment: 'voice_vec' };
 const VEC_KEYS = ['object_vec', 'face_vec', 'voice_vec'];
 const ENTITY = (n) => isMem(n) && !['conversation', 'diary'].includes(n.kind);
+// Named out loud by the owner (naming service): the name is theirs; the memory is never forgotten or merged away.
+const userNamed = (n) => n?.name_source === 'user';
+const NAMED = ' [named by the owner]';
 const dayId = (day) => `diary:${day.replace(/-/g, '')}`;
 const COVER_CAP = 12, MEDIA_CAP = 24;
 // One link per pair of entities, carrying nothing but natural-language text.
@@ -254,12 +257,12 @@ export class Memory {
       ...this.recallFragments(), ...earlier,
       ...(notes.length ? ['', '## Earlier diary notes (material)', ...notes.map((x, i) => `### Note ${i + 1} (${x.title || ''})\n${x.text}`)] : []),
       '', '## The day\'s conversations', ...convs.map((c) => `${c.id} | ${localTime(c.t_start)}–${localTime(c.t_last)} | ${c.name} | ${String(c.summary || '').slice(0, 160)}`),
-      '', '## Memory entities of the day', ...ents.map((g) => `${g.id} | ${g.kind} | ${g.name} | ${String(g.description || '').slice(0, 140)} | ${this.evidenceLine(g)}`),
+      '', '## Memory entities of the day', ...ents.map((g) => `${g.id} | ${g.kind} | ${g.name}${userNamed(g) ? NAMED : ''} | ${String(g.description || '').slice(0, 140)} | ${this.evidenceLine(g)}`),
       '', '## Links of the day (each link is one passage; rewrite ones that grew long, repetitive or outdated into one short passage with link rewrite)', ...links.map((e) => `${e.a} "${this.nameOf(e.a)}" — ${e.b} "${this.nameOf(e.b)}": ${String(e.text || '').replace(/\n/g, ' / ')}`),
       '', '## Possible duplicates (same kind with similar features or names; your call)', ...this.duplicateHints(all.filter(ENTITY)),
       '', '## All long-term memory entities (for de-duplication and merging)',
       'Evidence envelopes and source counts are not recall histories, independent encounters, importance scores or last-use dates. Diary/model links are not new observations. Missing evidence is unknown, not evidence of low importance.',
-      ...all.filter(ENTITY).map((g) => `${g.id} | ${g.kind} | ${g.name} | ${String(g.description || '').slice(0, 80)} | ${this.evidenceLine(g)}`)];
+      ...all.filter(ENTITY).map((g) => `${g.id} | ${g.kind} | ${g.name}${userNamed(g) ? NAMED : ''} | ${String(g.description || '').slice(0, 80)} | ${this.evidenceLine(g)}`)];
     return { text: lines.join('\n') };
   }
 
@@ -329,7 +332,7 @@ export class Memory {
     const crops = (J(g.covers) || []).slice(0, 6).map((c) => path.join(this.dir, 'img', coverFile(c))).filter((f) => fs.existsSync(f));
     const transcript = g.kind === 'conversation' ? (J(g.transcript) || []) : [];
     const fields = g.kind === 'conversation' ? `Summary: ${g.summary}\nFull transcript (${transcript.length} lines):\n${transcript.map((l) => `- ${localTime(l.t)} [${l.speaker}] ${l.text}`).join('\n')}` : `${g.description}`;
-    return { text: [`${g.id} | ${g.kind} | ${g.name}`, fields, this.evidenceLine(g), links.length ? 'Links:' : 'No links', ...links.slice(0, 40)].join('\n'), images: crops };
+    return { text: [`${g.id} | ${g.kind} | ${g.name}${userNamed(g) ? NAMED : ''}`, fields, this.evidenceLine(g), links.length ? 'Links:' : 'No links', ...links.slice(0, 40)].join('\n'), images: crops };
   }
 
   async search_memory({ query }) {
@@ -416,8 +419,19 @@ export class Memory {
     const expanded = this.expand(ids);
     // Identity consolidation can consume speech before its conversation is saved: the
     // candidate transcript and conversationMedia preserve that independent evidence.
-    const frags = expanded.filter((f) => FADES.has(this.nodes.get(f).kind) || ENTITY(this.nodes.get(f)));
+    let frags = expanded.filter((f) => FADES.has(this.nodes.get(f).kind) || ENTITY(this.nodes.get(f)));
     if (frags.length !== expanded.length) throw new Error('ids contains a node that cannot be consumed');
+    if (into && !ENTITY(this.nodes.get(into))) throw new Error('into must be an existing memory entity id');
+    // A memory the owner named survives a merge with its name: the others (including a requested target) merge into it.
+    const named = [...new Set([into, ...frags].filter((id) => id && userNamed(this.nodes.get(id))))];
+    if (named.length > 1) throw new Error(`${named.join(' and ')} were each named by the owner; they stay separate memories`);
+    let redirect = null;
+    if (named.length && named[0] !== into) {
+      if (into === 'person:owner') throw new Error(`${named[0]} was named by the owner and cannot be merged into person:owner`);
+      redirect = { from: into || null, description: fresh?.description || this.nodes.get(into)?.description };
+      frags = [...frags.filter((f) => f !== named[0]), ...(into ? [into] : [])];
+      into = named[0]; fresh = undefined;
+    }
     const targetKind = into ? this.nodes.get(into)?.kind : fresh?.kind;
     if (targetKind === 'event' && (!into || frags.some((f) => this.nodes.get(f).kind !== 'event'))) {
       throw new Error('Create timed events with remember_event; do not consume physical episodes or fragments as semantic events');
@@ -429,6 +443,7 @@ export class Memory {
       if (id === into || frags.includes(id) || ids.includes(ref.id)) throw new Error(`${ref.id} cannot be both reused evidence and the target or consumed identity material`);
       return { id, text: ref.text.trim() };
     });
+    if (redirect && !frags.length && !refs.length) throw new Error(`${into} was named by the owner and keeps its name; nothing else was given to merge into it (revise can update its description)`);
     if (!frags.length && !refs.length) throw new Error('nothing to consolidate');
     let gid;
     if (into) {
@@ -441,6 +456,7 @@ export class Memory {
       this.nodes.set(gid, { id: gid, kind: fresh.kind, layer: 'memory', name: fresh.name, description: fresh.description, summary: fresh.name, text: fresh.description, occurrences: 0, created_by: 'sleep-agent', nights: 0 });
     }
     const g = this.nodes.get(gid);
+    if (redirect?.description && !g.description) { g.description = redirect.description; g.text = redirect.description; }
     g.nights = Number(g.nights || 0) + (g._touched ? 0 : 1);
     g._touched = true;
     for (const i of ids) if (this.cands.has(i)) this.candToMemory.set(i, gid);
@@ -459,8 +475,9 @@ export class Memory {
       }
     }
     for (const { id, text } of refs) this.say(gid, id, text);
-    this.log('consolidate', { gist: gid, name: g.name, fragments: frags.length, merged_memories: merged, rewired, evidence: refs, why });
-    return { text: `Consolidated ${frags.length} fragment(s) into ${gid} (${g.name})` + (rewired ? `, moved ${rewired} link(s) over` : '') + (refs.length ? `, citing ${refs.length} kept memory evidence item(s)` : '') + '.' };
+    this.log('consolidate', { gist: gid, name: g.name, fragments: frags.length, merged_memories: merged, rewired, evidence: refs, why, ...(redirect && { kept_owner_named: gid, requested_into: redirect.from }) });
+    return { text: `Consolidated ${frags.length} fragment(s) into ${gid} (${g.name})` + (rewired ? `, moved ${rewired} link(s) over` : '') + (refs.length ? `, citing ${refs.length} kept memory evidence item(s)` : '') + '.'
+      + (redirect ? ` ${gid} "${g.name}" was named by the owner, so it is the surviving memory and keeps its name` + (redirect.from ? `; ${redirect.from} merged into it.` : '; no new memory was created.') : '') };
   }
 
   async remember_conversation({ id, title, summary, participants = [], why }) {
@@ -524,10 +541,11 @@ export class Memory {
     const frags = this.expand(ids);
     const locked = this.convLocked(frags);
     if (locked.length || ids.some((i) => this.cands.get(i)?.modality === 'conversation')) throw new Error('conversations cannot be forgotten tonight');
-    const doomed = frags.filter((f) => FADES.has(this.nodes.get(f).kind) || (ENTITY(this.nodes.get(f)) && f !== 'person:owner'));
+    const kept = frags.filter((f) => userNamed(this.nodes.get(f)));
+    const doomed = frags.filter((f) => !kept.includes(f) && (FADES.has(this.nodes.get(f).kind) || (ENTITY(this.nodes.get(f)) && f !== 'person:owner')));
     for (const f of doomed) this.drop(f);
-    this.log('forget', { fragments: doomed.length, why });
-    return { text: `Forgot ${doomed.length} fragment(s).` };
+    this.log('forget', { fragments: doomed.length, kept_owner_named: kept, why });
+    return { text: `Forgot ${doomed.length} fragment(s).` + (kept.length ? ` Kept ${kept.map((f) => `${f} "${this.nameOf(f)}"`).join(', ')}: named by the owner, so ${kept.length > 1 ? 'they' : 'it'} cannot be forgotten.` : '') };
   }
 
   async link({ a, b, text, rewrite = false }) {
@@ -552,11 +570,15 @@ export class Memory {
   async revise({ id, name, description }) {
     const g = this.nodes.get(id);
     if (!isMem(g) || g.kind === 'diary') throw new Error('only memory entities can be revised');
-    if (name) { g.name = name; g.summary = name; }
+    // The owner's spoken name stays; the description is still the sleep's to improve.
+    const refused = userNamed(g) && name && name !== g.name;
+    const note = refused ? `Kept the name "${g.name}": the owner named ${id}, so only its description can be revised.` : '';
+    if (refused && !description) { this.log('revise', { gist: id, name: g.name, refused_name: name }); return { text: note }; }
+    if (name && !refused) { g.name = name; g.summary = name; }
     if (description) { g.description = description; g.text = description; }
     g._touched = true;
-    this.log('revise', { gist: id, name: g.name });
-    return { text: 'Updated.' };
+    this.log('revise', { gist: id, name: g.name, ...(refused && { refused_name: name }) });
+    return { text: refused ? `Updated the description. ${note}` : 'Updated.' };
   }
 
   /** ⟦HH:MM⟧ / ⟦HH:MM:SS⟧ anchors (configured local time) -> the archived clip covering that moment, so the diary points at raw video/audio. */

@@ -4,6 +4,7 @@ import { pipeline } from 'node:stream/promises';
 
 const TIMEOUT_MS = 5000;
 const MAX_BYTES = 1024 * 1024;
+const MAX_FRAME_BYTES = 2 * 1024 * 1024, MAX_FRAMES = 6;
 const MAX_REFS = 10000;
 
 export class ArchiveError extends Error {
@@ -322,6 +323,72 @@ export class ArchiveClient {
     result.original_requires_auth = true;
     result.media_refs = this.mediaRefs(raw, evidence);
     return result;
+  }
+
+  // Still frames for get_video_frames: media_id with offsets (seconds from that video's start), or capture_id with
+  // absolute times, each resolved to the clip covering it. The JPEG bytes go back to the MCP caller as image content,
+  // so a client whose token only reaches /mcp still sees what the camera showed.
+  async getFrames(args = {}, { store, signal } = {}) {
+    const size = args.size ?? 768;
+    if (!Number.isInteger(size) || size < 160 || size > 1280) invalid();
+    const wanted = [];
+    if (args.media_id != null) {
+      if (args.capture_id != null || args.at != null || !Array.isArray(args.offsets) || !args.offsets.length || args.offsets.length > MAX_FRAMES) invalid();
+      const mediaId = id(args.media_id);
+      for (const offset of args.offsets) {
+        if (typeof offset !== 'number' || !Number.isFinite(offset) || offset < 0 || offset > 3600) invalid();
+        wanted.push({ media_id: mediaId, offset_s: offset });
+      }
+    } else {
+      if (args.capture_id == null || args.offsets != null || !Array.isArray(args.at) || !args.at.length || args.at.length > MAX_FRAMES) invalid();
+      for (const when of args.at) {
+        const atUs = timestampUs(date(when));
+        // Clips are seconds long: the one covering the time started at most a minute before it.
+        const page = await this.listVideoClips({ capture_id: args.capture_id, started_at: isoUs(atUs - 60e6), ended_at: isoUs(atUs), limit: 20 },
+          { store, signal });
+        const covering = (page.items ?? []).find((item) => { const span = interval(item); return span && span[0] <= atUs && atUs < span[1]; });
+        if (!covering) fail(404, 'archive_media_not_found', 'No video covers that time.');
+        // The video track can end a little before the clip's nominal duration: stay a quarter second inside it.
+        const [start, end] = interval(covering);
+        wanted.push({ media_id: covering.media_id, offset_s: Math.max(0, Math.min(atUs, end - 250_000) - start) / 1e6, at: isoUs(atUs) });
+      }
+    }
+    const frames = [];
+    for (const item of wanted) frames.push({ ...item, size, jpeg: await this.frame(item.media_id, item.offset_s, size, signal) });
+    return frames;
+  }
+
+  async frame(mediaId, seconds, size, signal) {
+    const controller = new AbortController();
+    const requestSignal = signal ? AbortSignal.any([controller.signal, signal]) : controller.signal;
+    const timeout = setTimeout(() => controller.abort(), 25000);  // the archive decodes with ffmpeg (bounded at 20 s)
+    try {
+      const url = new URL(this.base.href.replace(/\/$/, '') + '/v1/archive/media/' + encodeURIComponent(mediaId) + '/frame');
+      url.searchParams.set('t', seconds.toFixed(3));
+      url.searchParams.set('size', String(size));
+      const response = await fetch(url, { headers: { Authorization: `Bearer ${this.token}`, Accept: 'image/jpeg' }, redirect: 'error', signal: requestSignal });
+      if (!response.ok) {
+        await response.body?.cancel();
+        if (response.status === 404) fail(404, 'archive_media_not_found', 'Video clip not found.');
+        if (response.status === 422) fail(422, 'archive_frame_outside_media', 'That time is outside this video.');
+        fail(502, 'archive_request_failed', 'Video archive request failed.');
+      }
+      if (!/^image\/jpeg\b/i.test(response.headers.get('content-type') || '') || Number(response.headers.get('content-length')) > MAX_FRAME_BYTES) {
+        await response.body?.cancel();
+        fail(502, 'archive_invalid_response', 'Invalid video archive response.');
+      }
+      const chunks = [];
+      let total = 0;
+      for await (const chunk of response.body) {
+        total += chunk.length;
+        if (total > MAX_FRAME_BYTES) { controller.abort(); fail(502, 'archive_invalid_response', 'Invalid video archive response.'); }
+        chunks.push(chunk);
+      }
+      return Buffer.concat(chunks);
+    } catch (error) {
+      if (error instanceof ArchiveError) throw error;
+      fail(502, 'archive_request_failed', 'Video archive request failed.');
+    } finally { clearTimeout(timeout); }
   }
 
   async getVideoClip(args = {}, { store, signal } = {}) {

@@ -93,5 +93,38 @@ button:focus-visible { outline: 2px solid #0a84ff; outline-offset: 4px; }
 .flip svg { transition: transform .35s ease; }
 .flip.turned svg { transform: rotate(180deg); }
 
+/* Left of the shutter: the Okou mark. */
+.lead { grid-column: 1; justify-self: start; display: flex; align-items: center; gap: 10px; min-width: 0; }
+.okou {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: rgba(28, 28, 30, .6);
+}
+.okou path { fill: #8e8e93; transition: fill .25s ease; }
+.okou[data-connected="true"] path { fill: #ffa500; }
+
+/* Spoken namings and requests handed to Okou, from /v1/notices (app.js). */
+.toast {
+  position: absolute;
+  left: 50%;
+  bottom: calc(env(safe-area-inset-bottom) + 136px);
+  transform: translateX(-50%);
+  max-width: calc(100% - 32px);
+  padding: 9px 16px;
+  border-radius: 999px;
+  background: rgba(28, 28, 30, .78);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  backdrop-filter: saturate(180%) blur(20px);
+  font-size: 15px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.toast[data-tone="ok"] { background: rgba(48, 209, 88, .92); }
+
 [hidden] { display: none !important; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }

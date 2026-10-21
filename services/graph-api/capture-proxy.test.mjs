@@ -197,6 +197,7 @@ test('local static exact map serves fresh UI, MIME and observer-equivalent secur
     ['/assets/style.css', 'style.css', 'text/css; charset=utf-8'],
     ['/assets/icon.svg', 'icon.svg', 'image/svg+xml'],
     ['/assets/manifest.webmanifest', 'manifest.webmanifest', 'application/manifest+json'],
+    ['/assets/notices.js', 'notices.js', 'text/javascript; charset=utf-8'],
   ];
   for (const [path, file, mime] of files) {
     const result = await request(base + path + '?v=latest');

@@ -80,7 +80,7 @@ test('official MCP OAuth SDK discovers, registers, authorizes, reads tools/media
   assert.ok(provider.savedTokens.expires_in > 364 * 24 * 3600, 'access tokens are long-lived');
   client = new Client({ name: 'authenticated-tools-integration', version: '1.0.0' });
   await client.connect(new StreamableHTTPClientTransport(new URL(origin + '/mcp'), { authProvider: provider }));
-  assert.equal((await client.listTools()).tools.length, 6);
+  assert.equal((await client.listTools()).tools.length, 7);
   for (const [name, args] of [['search_entities', {}], ['get_entity', { id: 'episode:synthetic' }], ['list_entity_links', { id: 'episode:synthetic' }], ['get_subgraph', { ids: ['episode:synthetic'] }], ['list_video_clips', { entity_id: 'episode:synthetic' }], ['get_video_clip', { media_id: mediaId }]]) {
     const r = await client.callTool({ name, arguments: args }); assert.ok(!r.isError, `${name} must be accessible with the approved scopes`);
   }

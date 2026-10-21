@@ -5,7 +5,9 @@ import { ApiError } from './graph.mjs';
 import { ArchiveError } from './archive.mjs';
 import { cursors, parseFilter } from './validation.mjs';
 
-export const TOOL_SCOPES = Object.freeze({ search_entities: 'graph:read', get_entity: 'graph:read', list_entity_links: 'graph:read', get_subgraph: 'graph:read', list_video_clips: 'media:read', get_video_clip: 'media:read' });
+export const TOOL_SCOPES = Object.freeze({ search_entities: 'graph:read', get_entity: 'graph:read', list_entity_links: 'graph:read', get_subgraph: 'graph:read', list_video_clips: 'media:read', get_video_clip: 'media:read', get_video_frames: 'media:read' });
+// A tool result that is MCP content itself (images), not JSON to wrap.
+const CONTENT = Symbol('mcp content');
 
 const id = z.string().min(1).max(512).regex(/^[^\u0000-\u001f]+$/);
 const mediaId = z.string().regex(/^media_[a-f0-9]{32}$/);
@@ -66,6 +68,19 @@ export function createMcpHandler({ store, cursorKey, archive, allowedOrigins = p
       if (!archive) throw new ApiError(503, 'archive_unavailable', 'Archive is not configured');
       return archive.getVideoClip(args, { store, signal: extra.signal });
     }],
+    ['get_video_frames', 'Still frames (JPEG images) of original archived videos: what the camera showed. Give media_id with offsets in seconds from that video\'s start (list_video_clips returns media IDs and times), or capture_id with absolute times (RFC 3339 with offset). Up to 6 frames per call; size is the longer side in pixels.', {
+      media_id: mediaId.optional(), offsets: z.array(z.number().min(0).max(3600)).min(1).max(6).optional(),
+      capture_id: z.string().min(1).max(80).regex(/^[a-zA-Z0-9_-]+$/).optional(),
+      at: z.array(z.string().datetime({ offset: true })).min(1).max(6).optional(),
+      size: z.number().int().min(160).max(1280).default(768),
+    }, async (args, extra) => {
+      if (!archive) throw new ApiError(503, 'archive_unavailable', 'Archive is not configured');
+      const frames = await archive.getFrames(args, { store, signal: extra.signal });
+      const listed = frames.map(({ jpeg, ...frame }) => frame);
+      return { [CONTENT]: { content: [{ type: 'text', text: JSON.stringify({ frames: listed }) },
+        ...frames.map((frame) => ({ type: 'image', data: frame.jpeg.toString('base64'), mimeType: 'image/jpeg' }))],
+        structuredContent: { frames: listed } } };
+    }],
   ];
   function buildServer() {
     const server = new McpServer({ name: 'eleagent', version: '0.1.0' }, {
@@ -75,6 +90,7 @@ export function createMcpHandler({ store, cursorKey, archive, allowedOrigins = p
       server.registerTool(name, { description, inputSchema: z.object(shape).strict(), annotations }, async (args, extra) => {
         try {
           const result = await run(args, extra);
+          if (result?.[CONTENT]) return result[CONTENT];
           return { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result };
         } catch (error) {
           const known = error instanceof ApiError || error instanceof ArchiveError;

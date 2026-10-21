@@ -31,6 +31,7 @@ const archive = {
   async listVideoClips(args, deps) { assert.equal(deps.store, store); return { media: [], next_cursor: null, filters: args }; },
   async getVideoClip(args, deps) { assert.equal(deps.store, store); return { media_id: args.media_id, original_url: `/v1/archive/media/${args.media_id}/original` }; },
   async proxyOriginal(req, res) { res.writeHead(206, { 'Content-Type': 'video/mp4', 'Content-Range': 'bytes 0-2/3' }); res.end('abc'); },
+  async getFrames(args, deps) { assert.equal(deps.store, store); return [{ media_id: args.media_id, offset_s: args.offsets[0], size: args.size, jpeg: Buffer.from('jpeg-bytes') }]; },
 };
 before(async () => {
   server = createApiServer({ store, cursorKey, archive, ...resourceAuth(token) });
@@ -44,9 +45,9 @@ after(async () => { await client?.close(); await new Promise((resolve) => server
 const call = (name, args = {}) => client.callTool({ name, arguments: args });
 const json = (r) => JSON.parse(r.content[0].text);
 
-test('standard MCP SDK initializes and discovers exactly six strictly read-only tools', async () => {
+test('standard MCP SDK initializes and discovers exactly seven strictly read-only tools', async () => {
   const result = await client.listTools();
-  assert.deepEqual(result.tools.map((x) => x.name), ['search_entities', 'get_entity', 'list_entity_links', 'get_subgraph', 'list_video_clips', 'get_video_clip']);
+  assert.deepEqual(result.tools.map((x) => x.name), ['search_entities', 'get_entity', 'list_entity_links', 'get_subgraph', 'list_video_clips', 'get_video_clip', 'get_video_frames']);
   for (const tool of result.tools) { assert.equal(tool.annotations.readOnlyHint, true); assert.equal(tool.annotations.destructiveHint, false); assert.equal(tool.inputSchema.additionalProperties, false); }
 });
 test('graph tools reuse signed pagination bound to query and retain structured graph data', async () => {
@@ -102,4 +103,15 @@ test('body bounds and legacy REST graph endpoint remain intact', async () => {
   assert.equal(response.status, 413);
   const legacy = await fetch(`${origin}/v1/graph/entities/entity:one`, { headers: { Authorization: `Bearer ${token}` } });
   assert.equal(legacy.status, 200); assert.equal((await legacy.json()).id, 'entity:one');
+});
+
+test('frames come back as MCP image content, so a client needs nothing beyond /mcp to see them', async () => {
+  const id = `media_${'b'.repeat(32)}`;
+  const result = await call('get_video_frames', { media_id: id, offsets: [2.5] });
+  assert.ok(!result.isError);
+  assert.deepEqual(JSON.parse(result.content[0].text).frames, [{ media_id: id, offset_s: 2.5, size: 768 }]);
+  assert.equal(result.content[1].type, 'image');
+  assert.equal(result.content[1].mimeType, 'image/jpeg');
+  assert.equal(Buffer.from(result.content[1].data, 'base64').toString(), 'jpeg-bytes');
+  assert.equal((await call('get_video_frames', { media_id: id, offsets: [1, 2, 3, 4, 5, 6, 7] })).isError, true);
 });

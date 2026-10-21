@@ -106,6 +106,7 @@ sudo install -d -m 0750 /srv/eleagent/data/minicpm-cache
 # Spark 2
 sudo install -d -m 2750 -o 10001 -g 10001 /srv/eleagent/data/archive
 sudo install -d -m 0750 -o 1000 -g 1000 /srv/eleagent/data/recognition
+sudo install -d -m 0700 -o 1000 -g 1000 /srv/eleagent/data/agent
 ```
 
 The archive runs as UID 10001. Graph Sync runs as UID 1000 with supplementary group 10001 so it can read the archive database and its WAL. The model root must be writable by UID 1000; a root-owned model root makes later downloads fail. On the Migration path, skip the data directories that Phase 4 will copy in: the copy refuses existing destinations.
@@ -119,6 +120,7 @@ Expected model directories under `MODEL_ROOT`:
 | Spark 2 | `campplus` | Speaker embeddings |
 | Spark 2 | `qwen3-asr-1.7b` | Speech transcription |
 | Spark 2 | `ocr` | Three checksum-pinned OCR ONNX files |
+| Spark 2 | `qwen3.6-35b-a3b-fp8` | Local VLM for naming and the day agent (Qwen3.6-35B-A3B FP8, vLLM-loadable); another model goes in its own directory named by `VLM_MODEL_DIR` |
 | Both | `glm-5.3-flash-atlas` | GLM and DFlash2 sources, plus the converted Atlas overlay |
 
 ### Order
@@ -253,6 +255,28 @@ PY
 
 Back up this entire directory consistently, including `auth.sqlite`, its SQLite WAL state and `secret`. Do not delete it, regenerate the secret, or overwrite owner credentials on redeploy. Run exactly one graph-api process/instance per auth database; issuance and revocation use a process-local queue. Changing `AUTH_PUBLIC_URL` changes the issuer/resource, so MCP clients must authorize again. Never derive the issuer from incoming Host/forwarding headers.
 
+The day agent on Spark 2 hands requests to Okou with access tokens it fetches from graph-api's internal listener on Spark 1. Set `AGENT_INTERNAL_ADDR` in `.env` to the Spark 1 address on the direct Spark link plus a free port (for example `10.100.24.1:22404`); the listener binds only there. Both sides prove themselves with one shared secret. Generate it on Spark 1 and copy exactly the same file privately to Spark 2:
+
+```sh
+# Spark 1
+set -a; . ./.env; set +a
+python3 - <<'PY'
+import os, secrets
+from pathlib import Path
+path = Path(os.environ['DATA_ROOT']) / 'auth' / 'agent-internal.token'
+try:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+except FileExistsError:
+    pass  # Keep an existing secret; Spark 2 holds the same value.
+else:
+    with os.fdopen(fd, 'w') as f:
+        f.write(secrets.token_hex(32) + '\n')
+PY
+# Spark 2: the same bytes at $DATA_ROOT/agent/internal.token, UID 1000, mode 0600
+```
+
+The Okou connection itself is approved by the owner in the browser after the services run (Phase 6); its tokens stay in `$DATA_ROOT/auth/okou.json` on Spark 1 and the agent never sees the refresh token.
+
 `OBSERVER_URL` defaults to the private HTTP observer (`http://127.0.0.1:8080`). If an existing observer uses HTTPS, preserve it and set `OBSERVER_URL`, `OBSERVER_CA_HOST_FILE` (trusted host certificate path), and `OBSERVER_CA_FILE=/run/tls/observer.crt`. Certificate and hostname verification remain enabled. Public ingress must point to the authenticated graph gateway, never directly to observer/archive/GPU endpoints.
 
 ### Images
@@ -267,6 +291,9 @@ bash ../minicpm/build.sh
 # Spark 2
 docker compose --env-file .env -f compose.spark2.yaml config --quiet
 docker compose --env-file .env -f compose.spark2.yaml build archive text graph-sync recognition speech
+docker compose --env-file .env -f compose.spark2.yaml build naming    # on the recognition image
+docker compose --env-file .env -f compose.spark2.yaml build agent     # on the naming image
+docker compose --env-file .env -f compose.spark2.yaml pull vlm        # skip when VLM_IMAGE is already local
 # Both hosts
 bash ../atlas/build.sh    # prints the image ID used for conversion and the manager
 ```
@@ -323,7 +350,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now eleagent-gpu-manager.service
 ```
 
-The manager timezone must equal `ELEAGENT_TIMEZONE`. The night window starts at 00:30, permits acquisition before 05:00, and ends at 05:30 local time. On Spark 1 the manager stops only `eleagent-minicpm`; on Spark 2 only `eleagent-recognition` and `eleagent-speech`. The observer and CPU services keep running.
+The manager timezone must equal `ELEAGENT_TIMEZONE`. The night window starts at 00:30, permits acquisition before 05:00, and ends at 05:30 local time. On Spark 1 the manager stops `eleagent-minicpm`; the observer, Graph API and graph keep running for uploads, sign-in and Sleep. On Spark 2 it stops recognition, speech, text, naming, the day agent and the VLM, in that order; only the archive and Graph Sync keep running, because Sleep reads the archive and Graph Sync hands it the last fragments. In the morning the VLM must answer `http://127.0.0.1:22410/health` before daytime work resumes. Any other GPU container on a host must be added with `--daytime-container <name>` (and `--ready-url` if it loads a model); otherwise its memory stays taken, the manager refuses the night with `insufficient_available_memory`, and Sleep does not run.
 
 **Success:** all images exist with recorded IDs; `config --quiet` passes on both hosts; `systemctl is-active eleagent-gpu-manager` is `active`, and `GET http://<private-address>:9210/status` with the control token reports `idle` with no lease on both hosts.
 **On failure:** registry or network errors during builds are not reasons to edit Dockerfiles. Use a reuse option above, or report the missing dependency and ask whether a download is approved.
@@ -397,7 +424,7 @@ docker compose --env-file .env -f compose.spark2.yaml up -d --no-build
 docker compose --env-file .env -f compose.spark1.yaml up -d --no-build graph minicpm observer graph-api
 ```
 
-Wait for readiness: Neo4j healthy, MiniCPM `http://127.0.0.1:22400/health` reporting `model_loaded: true`, recognition and speech readiness markers written, and `python3 ../../runtime/gpu-manager/ready.py --config /etc/eleagent/gpu-manager.json` exiting 0 on both hosts as UID 1000. Model loading can take several minutes. Confirm the observer's private `GET http://127.0.0.1:8080/` returns the page and anonymous upload remains rejected. At the gateway, unauthenticated `GET http://127.0.0.1:22403/` must redirect to sign-in; unauthenticated MCP/graph/media calls return 401. Complete the first-owner initialization below before handing the public address to the owner.
+Wait for readiness: Neo4j healthy, MiniCPM `http://127.0.0.1:22400/health` reporting `model_loaded: true`, the VLM's `http://127.0.0.1:22410/health` answering 200 on Spark 2, recognition and speech readiness markers written, and `python3 ../../runtime/gpu-manager/ready.py --config /etc/eleagent/gpu-manager.json` exiting 0 on both hosts as UID 1000. Model loading can take several minutes. Confirm the observer's private `GET http://127.0.0.1:8080/` returns the page and anonymous upload remains rejected. At the gateway, unauthenticated `GET http://127.0.0.1:22403/` must redirect to sign-in; unauthenticated MCP/graph/media calls return 401. Complete the first-owner initialization below before handing the public address to the owner.
 
 ### First-owner initialization (choose email, generate password)
 
@@ -476,5 +503,6 @@ After the new stack is running, ask the owner before this step. Then:
 2. Give the owner the plain `https://<capture-host>/` URL (a QR may contain only that ordinary URL, no credentials). Anonymous visits redirect to email/password sign-in; sign-in returns to capture. Do not distribute service keys or create token fragments. After verifying the unified origin, retire old public tunnels that directly expose observer. Keep the internal observer/archive/GPU listeners private.
 3. The page starts recording as soon as it opens. The owner allows the camera, microphone and location, keeps the page in the foreground, and speaks normally for 10–15 seconds. The page has two controls: record/pause, and switching between the back and front cameras. Switching apps or locking the phone pauses recording, and returning to the page resumes it. Clips wait in the browser's bounded queue until the server confirms archival, so browser data must not be cleared while uploads are pending.
 4. Confirm on the servers: new clips archived, MiniCPM, recognition, OCR and speech events for them, a non-empty transcript, and queues draining. Short queues after a burst of buffered uploads are normal; a growing backlog is not.
+5. Connect Okou: the Okou mark at the bottom left of the capture page is grey until Eleagent is connected. The owner taps it, signs in to Okou and approves; the page comes back with the mark in colour. Confirm with the owner's session that `GET /okou/status` reports `connected: true`, and on Spark 2 that the agent logs `start` with an Okou thread. Then a spoken request such as "Okou, book a meeting with … tomorrow afternoon" shows "已交给 Okou：…" on the phone and arrives in the owner's Okou chat.
 
 **On failure:** check upload responses first. a gateway `401` means the session expired—sign in again without clearing pending clips; an internal backend authentication failure is a server configuration issue, not a reason to ask the user for a token; a conflict means a capture identity was reused for different bytes. Then check that each service is running and its queue is moving.
