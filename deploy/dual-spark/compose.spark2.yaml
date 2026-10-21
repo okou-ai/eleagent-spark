@@ -63,6 +63,10 @@ services:
         RECOGNITION_BASE_IMAGE: ${RECOGNITION_BASE_IMAGE:-python:3.12-slim}
         REUSE_INSTALLED_TORCH: ${REUSE_INSTALLED_TORCH:-0}
     container_name: eleagent-speech
+    # Every clip is analysed on arrival with the clip(s) held from before it; finished turns go to the archive at once,
+    # a turn still running waits for the next clip (or 8 s of idle). Catching up takes 2 new clips at a time.
+    # None of this is part of the speech pipeline id: no history is reprocessed.
+    command: ["-m", "entity_worker.speech", "--window-clips", "2", "--idle-seconds", "8"]
     network_mode: host
     user: "1000:1000"
     restart: unless-stopped
@@ -122,3 +126,103 @@ services:
       - ${DATA_ROOT}/archive:/archive:ro
       - ${DATA_ROOT}/recognition:/entities
     depends_on: [archive, recognition]
+
+  # Local VLM (vLLM, OpenAI-compatible on 127.0.0.1:22410) for naming and the day agent. Tool calls (qwen3_coder: the
+  # model writes <tool_call><function=...> XML) serve the agent; thinking is off by default (short structured answers);
+  # prefix caching reuses the fixed system prompts. 0.40 of the GB10's unified memory leaves the other Spark 2 services
+  # their headroom. The GPU manager stops it at night. Another model: put it in MODEL_ROOT and set VLM_MODEL_DIR.
+  vlm:
+    image: ${VLM_IMAGE:-nvcr.io/nvidia/vllm:26.09-py3}
+    container_name: eleagent-vlm
+    network_mode: host
+    ipc: host
+    shm_size: 8g
+    restart: unless-stopped
+    gpus: all
+    command:
+      - vllm
+      - serve
+      - /models/vlm
+      - --served-model-name
+      - ${NAMING_VLM_MODEL:-qwen3.6-35b-a3b}
+      - --host
+      - 127.0.0.1
+      - --port
+      - "22410"
+      - --max-model-len
+      - "32768"
+      - --max-num-seqs
+      - "8"
+      - --gpu-memory-utilization
+      - ${VLM_GPU_MEMORY_UTILIZATION:-0.40}
+      - --limit-mm-per-prompt
+      - '{"image": 2, "video": 0}'
+      - --enable-prefix-caching
+      - --default-chat-template-kwargs
+      - '{"enable_thinking": false}'
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+    volumes:
+      - ${MODEL_ROOT}/${VLM_MODEL_DIR:-qwen3.6-35b-a3b-fp8}:/models/vlm:ro
+    stop_grace_period: 30s
+
+  # Spoken object naming ("这是我的蓝色水杯"): archive speech turns -> local VLM intent + grounding -> named memory
+  # object + its :ObjectView views + :NamingEvent, under the graph-sync / sleep writer lock. CPU only (the VLM is the
+  # vlm service above); DINOv2-S is loaded on CPU only when a VLM box overlaps no strong detection.
+  naming:
+    image: local/eleagent-naming:production
+    build:
+      context: ../../services/recognition
+      dockerfile: naming/Dockerfile
+      args:
+        NAMING_BASE_IMAGE: local/eleagent-recognition:production
+    container_name: eleagent-naming
+    network_mode: host
+    user: "1000:1000"
+    group_add: ["10001"]
+    restart: unless-stopped
+    environment:
+      <<: *recognition-environment
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?Generate the graph password}
+      GRAPH_URL: bolt://${SPARK1_ADDRESS:?Set the private Spark 1 address}:7687
+      ARCHIVE_DB: /archive/archive.sqlite3
+      VLM_URL: ${NAMING_VLM_URL:-http://127.0.0.1:22410/v1}
+      VLM_MODEL: ${NAMING_VLM_MODEL:-qwen3.6-35b-a3b}
+      YOLO_CONFIG_DIR: /tmp/ultralytics
+    volumes:
+      - ${DATA_ROOT}/archive:/archive:ro
+      - ${MODEL_ROOT}/entities:/models/entities:ro
+    depends_on: [archive, vlm]
+    stop_grace_period: 30s
+
+  # Day agent: hears the user ask Okou for help while recording (local VLM), writes one self-contained message with
+  # the moment's context (time, place, transcript, people and things in view, memory) and hands it to Okou through
+  # api.okou.ai/mcp. The Okou access token comes from graph-api on Spark 1 over the Spark link (AGENT_INTERNAL_ADDR).
+  agent:
+    image: local/eleagent-agent:production
+    build:
+      context: ../../services/recognition
+      dockerfile: agent/Dockerfile
+      args:
+        AGENT_BASE_IMAGE: local/eleagent-naming:production
+    container_name: eleagent-agent
+    network_mode: host
+    user: "1000:1000"
+    group_add: ["10001"]
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?Generate the graph password}
+      GRAPH_URL: bolt://${SPARK1_ADDRESS:?Set the private Spark 1 address}:7687
+      ARCHIVE_DB: /archive/archive.sqlite3
+      VLM_URL: ${NAMING_VLM_URL:-http://127.0.0.1:22410/v1}
+      VLM_MODEL: ${NAMING_VLM_MODEL:-qwen3.6-35b-a3b}
+      ELEAGENT_TIMEZONE: ${ELEAGENT_TIMEZONE:-America/Los_Angeles}
+      OKOU_TOKEN_URL: http://${AGENT_INTERNAL_ADDR:-10.100.24.1:22404}/internal/okou/token
+      AGENT_INTERNAL_TOKEN_FILE: /agent/internal.token
+      OKOU_AGENT_ID: ${OKOU_AGENT_ID:-}
+    volumes:
+      - ${DATA_ROOT}/archive:/archive:ro
+      - ${DATA_ROOT}/agent:/agent:ro
+    depends_on: [archive, vlm]
+    stop_grace_period: 20s

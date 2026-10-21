@@ -154,9 +154,8 @@ class Manager:
                 minute = now.hour * 60 + now.minute
                 if not self.c['acquire_start_minute'] <= minute < self.c['acquire_end_minute']:
                     return 409, {'error_type': 'outside_acquire_window'}
-                available, oom = memory()
-                if available < self.c.get('recovery_available_gib', 64) * GIB:
-                    return 409, {'error_type': 'insufficient_available_memory'}
+                # Memory is checked in prepare(), once the daytime services have released theirs.
+                _, oom = memory()
                 stop_hour, stop_minute = divmod(self.c['hard_stop_minute'], 60)
                 deadline = now.replace(hour=stop_hour, minute=stop_minute, second=0, microsecond=0).timestamp()
                 self.s = {'version': 1, 'phase': 'preparing', 'lease': lease,
@@ -257,6 +256,13 @@ class Manager:
             command(['docker', 'stop', '-t', '30', row['id']], timeout=40)
             if inspect(row['id'])['State']['Running']:
                 raise RuntimeError('daytime_still_running')
+        end = time.monotonic() + 60
+        while memory()[0] < self.c.get('recovery_available_gib', 64) * GIB:
+            self.check('preparing')
+            if time.monotonic() >= end:
+                raise RuntimeError('insufficient_available_memory')
+            self.wake.wait(1)
+            self.wake.clear()
         with self.lock:
             self.check('preparing')
             self.s['phase'] = 'prepared'
@@ -299,7 +305,10 @@ class Manager:
                 if inspect(c['Id'])['State']['Running']:
                     raise RuntimeError('rank_still_running')
             command(['docker', 'rm', c['Id']], timeout=20)
-        if memory()[0] < self.c.get('recovery_available_gib', 64) * GIB:
+        # Wait for a rank's memory before daytime starts again. Without a rank nothing will release it, and once
+        # daytime runs (the naming VLM alone holds ~46 GB) the floor no longer applies.
+        stopped = any(not inspect(row['id'])['State']['Running'] for row in self.s.get('daytime', []))
+        if stopped and (c or self.s.get('rank_id')) and memory()[0] < self.c.get('recovery_available_gib', 64) * GIB:
             raise RuntimeError('waiting_memory_recovery')
         for row in self.s.get('daytime', []):
             c = inspect(row['id'])

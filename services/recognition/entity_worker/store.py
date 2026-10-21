@@ -82,11 +82,16 @@ class Store:
           model TEXT NOT NULL, media_id TEXT NOT NULL, capture_id TEXT NOT NULL, offset REAL NOT NULL,
           started_at TEXT NOT NULL, data TEXT NOT NULL, assignment TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS sample_entity ON samples(entity_id);
+        -- Short-term tracking looks up one capture's recent samples per detection; without this it scans all history.
+        CREATE INDEX IF NOT EXISTS sample_track ON samples(model, capture_id, started_at);
         CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, payload TEXT NOT NULL, error TEXT);
         CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS rejected_events (id TEXT PRIMARY KEY, payload TEXT NOT NULL, error TEXT NOT NULL, rejected_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS speech_pending (media_id TEXT PRIMARY KEY, capture_id TEXT NOT NULL,
           clip_seq INTEGER NOT NULL, asset TEXT NOT NULL, seen_at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS speech_context (media_id TEXT PRIMARY KEY, capture_id TEXT NOT NULL,
+          clip_seq INTEGER NOT NULL, asset TEXT NOT NULL, seen_at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS speech_progress (capture_id TEXT PRIMARY KEY, published_until TEXT, holding INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS media_frames (media_id TEXT PRIMARY KEY, sampled_frames INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS corrections (id TEXT PRIMARY KEY, action TEXT NOT NULL,
           body TEXT NOT NULL, created_at TEXT NOT NULL);
@@ -428,6 +433,10 @@ class Store:
 
     def pending_events(self, limit=32):
         return [dict(row) for row in self.db.execute('SELECT id,payload,error FROM outbox ORDER BY rowid LIMIT ?', (limit,))]
+
+    def outbox_events(self, ids):
+        rows = (self.db.execute('SELECT id,payload,error FROM outbox WHERE id=?', (i,)).fetchone() for i in ids)
+        return [dict(row) for row in rows if row]
 
     def event_ack(self, event_id):
         # A persisted archive receipt confirms its exact observations. This is

@@ -22,6 +22,11 @@ def main():
     parser.add_argument('--fabric-hca', required=True)
     parser.add_argument('--timezone', default='America/Los_Angeles')
     parser.add_argument('--minicpm-health-url', default='http://127.0.0.1:22400/health')
+    # Any other GPU container must be handed over too, or the night cannot start.
+    parser.add_argument('--daytime-container', action='append', default=[],
+                        help='another GPU container to stop at night and restart afterwards (repeatable)')
+    parser.add_argument('--ready-url', action='append', default=[],
+                        help='endpoint that must answer 200 before daytime work resumes (repeatable)')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     for key in ('data_dir', 'model_root', 'repo_dir', 'state_dir', 'output'):
@@ -43,8 +48,12 @@ def main():
         'host_role': args.role,
         'data_dir': str(args.data_dir),
         'minicpm_health_url': args.minicpm_health_url,
-        'daytime_containers': ['eleagent-minicpm'] if args.role == 's1' else
-                              ['eleagent-recognition', 'eleagent-speech'],
+        # The night belongs to Sleep: Spark 2 keeps only the archive (Sleep reads it, uploads land in it) and Graph
+        # Sync (it hands Sleep the last fragments). Each stopped service resumes from its own cursor. Containers stop
+        # and restart in this order, so naming and the day agent stop before the VLM they call.
+        'daytime_containers': (['eleagent-minicpm'] if args.role == 's1' else
+                               ['eleagent-recognition', 'eleagent-speech', 'eleagent-text', 'eleagent-naming',
+                                'eleagent-agent', 'eleagent-vlm']) + args.daytime_container,
         'pause_workers': {'minicpm': 'eleagent-observer'} if args.role == 's1' else
                          {'entity': 'eleagent-recognition', 'speech': 'eleagent-speech'},
         'rank_name': 'eleagent-glm-rank' + rank,
@@ -61,6 +70,8 @@ def main():
         'pause_files': [str(args.data_dir / 'night-gpu.pause')],
         'drain_commands': [['python3', str(runtime / 'drain.py'), '--config', str(args.output)]],
         'ready_commands': [['python3', str(runtime / 'ready.py'), '--config', str(args.output)]],
+        # Spark 2's VLM takes minutes to load after a restart; daytime work resumes once it answers.
+        'ready_urls': ([] if args.role == 's1' else ['http://127.0.0.1:22410/health']) + args.ready_url,
         'drain_timeout_seconds': 600,
         'lease_ttl_seconds': 120,
         'min_available_gib': 4,

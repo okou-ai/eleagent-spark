@@ -28,7 +28,7 @@ async function jsonBody(req) {
   return result;
 }
 
-export function createApiServer({ store, cursorKey, archive, capture, authService, authPublicUrl, onRequest = () => {} }) {
+export function createApiServer({ store, cursorKey, archive, capture, notices, okou, authService, authPublicUrl, onRequest = () => {} }) {
   if (typeof cursorKey !== 'string' || cursorKey.length < 32) throw new Error('A private cursor signing key is required');
   if (!authService || !authPublicUrl) throw new Error('OAuth and an explicit public URL are required');
   const cursor = cursors(cursorKey);
@@ -116,6 +116,29 @@ export function createApiServer({ store, cursorKey, archive, capture, authServic
           return sendAuthPage(res, url.pathname.slice('/auth/'.length));
         }
         throw new ApiError(404, 'not_found', 'Account route not found');
+      }
+      if (okou && authService && okou.matches(url.pathname)) {
+        route = 'okou';
+        if (okou.isPublic(url.pathname)) return await okou.handle(req, res, url);
+        if (req.method === 'POST') requireSameOrigin(req, authPublicUrl);
+        const session = await authService.getOwnerSession((await authRequest(req, authPublicUrl)).headers);
+        if (!session) {
+          req.resume();
+          if (req.method === 'GET' && url.pathname !== '/okou/status') {
+            res.writeHead(302, { Location: '/auth/sign-in?return_to=' + encodeURIComponent(url.pathname) }); return res.end();
+          }
+          return send(401, { error: { code: 'sign_in_required', message: 'Sign in to connect Okou' } });
+        }
+        return await okou.handle(req, res, url);
+      }
+      if (notices && authService && notices.matches(url.pathname)) {
+        route = 'notices';
+        const session = await authService.getOwnerSession((await authRequest(req, authPublicUrl)).headers);
+        if (!session) {
+          req.resume();
+          return send(401, { error: { code: 'sign_in_required', message: 'Sign in to use the capture page' } });
+        }
+        return await notices.handle(req, res, url);
       }
       const capturePath = url.pathname === '/' || (['GET', 'HEAD'].includes(req.method) && (url.pathname === '/v1/observations/latest' || /^\/assets\/[a-zA-Z0-9_.-]+$/.test(url.pathname))) || (req.method === 'POST' && url.pathname === '/v1/clips');
       if (capture && capturePath && ['GET', 'HEAD', 'POST'].includes(req.method)) {

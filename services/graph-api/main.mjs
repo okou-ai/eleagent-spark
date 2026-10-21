@@ -7,6 +7,8 @@ import { createApiServer } from './server.mjs';
 import { ArchiveClient } from './archive.mjs';
 import { createAuthService } from './auth.mjs';
 import { createCaptureProxy } from './capture-proxy.mjs';
+import { createNoticesHandler } from './notices.mjs';
+import { createOkouConnection } from './okou.mjs';
 
 const auth = process.env.NEO4J_AUTH || '';
 const slash = auth.indexOf('/');
@@ -38,14 +40,21 @@ const store = new GraphStore(driver, { timeoutMs: 5000 });
 const counts = new Map();
 const durations = new Map();
 let inShutdown = false;
+// The public origin makes get_video_clip's original_url absolute, so MCP clients do not have to guess the host.
 const archive = process.env.ARCHIVE_URL ? new ArchiveClient({
-  url: process.env.ARCHIVE_URL, token: process.env.SCENE_ARCHIVE_TOKEN,
+  url: process.env.ARCHIVE_URL, token: process.env.SCENE_ARCHIVE_TOKEN, publicBaseUrl: authPublicUrl,
 }) : undefined;
 const capture = process.env.OBSERVER_URL ? createCaptureProxy({
   url: process.env.OBSERVER_URL, token: process.env.OBSERVER_INTERNAL_TOKEN,
   caFile: process.env.OBSERVER_CA_FILE || undefined, webRoot: process.env.CAPTURE_WEB_ROOT,
 }) : undefined;
-const server = createApiServer({ store, cursorKey, archive, capture, authService, authPublicUrl, onRequest(route, status, seconds) {
+// The capture page's toasts (/v1/notices).
+const notices = createNoticesHandler({ store });
+// Eleagent as an MCP OAuth client of Okou; the day agent gets its access token over the Spark link only.
+const okou = process.env.OKOU_STATE_FILE ? createOkouConnection({ publicUrl: authPublicUrl, file: process.env.OKOU_STATE_FILE }) : undefined;
+const internal = okou && process.env.AGENT_INTERNAL_ADDR && process.env.AGENT_INTERNAL_TOKEN_FILE
+  ? http.createServer(okou.internalHandler(readFileSync(process.env.AGENT_INTERNAL_TOKEN_FILE, 'utf8').trim())) : undefined;
+const server = createApiServer({ store, cursorKey, archive, capture, notices, okou, authService, authPublicUrl, onRequest(route, status, seconds) {
   const key = `route="${route}",status="${status}"`;
   counts.set(key, (counts.get(key) || 0) + 1);
   const old = durations.get(route) || { count: 0, sum: 0 };
@@ -73,12 +82,16 @@ const listen = (s, port, host) => new Promise((resolve, reject) => {
 });
 await listen(server, Number(process.env.PORT || 22403), process.env.HOST || '127.0.0.1');
 await listen(metrics, Number(process.env.METRICS_PORT || 9208), '127.0.0.1');
+if (internal) {
+  const [host, port] = process.env.AGENT_INTERNAL_ADDR.split(':');
+  await listen(internal, Number(port), host);
+}
 console.log('scene-graph-api ready');
 async function stop() {
   if (inShutdown) return;
   inShutdown = true;
   const force = setTimeout(() => process.exit(1), 15_000).unref();
-  await Promise.all([server, metrics].map((s) => new Promise((resolve) => s.close(resolve))));
+  await Promise.all([server, metrics, internal].filter(Boolean).map((s) => new Promise((resolve) => s.close(resolve))));
   await driver.close();
   await authService.close();
   clearTimeout(force);

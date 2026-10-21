@@ -4,11 +4,22 @@ import argparse
 from datetime import datetime
 import json
 from pathlib import Path
+import urllib.request
 
 from drain import minicpm_idle, running_containers
 
 
+def answers(url):
+    # Bypass ambient HTTP proxies for a host-configured internal health endpoint.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(url, timeout=5) as response:
+        return response.status == 200
+
+
 def ready(config):
+    # Paused speech must not resume into a service that is still loading its model.
+    if not all(answers(url) for url in config.get('ready_urls', [])):
+        return False
     if config['host_role'] == 's1':
         running_containers(config['daytime_containers'])
         return minicpm_idle(config['minicpm_health_url'])
